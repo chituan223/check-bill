@@ -1,0 +1,157 @@
+import logging
+import requests
+import datetime
+import json
+import os
+import asyncio
+from telegram.ext import ApplicationBuilder
+
+# ==================== CẤU HÌNH ====================
+TOKEN = "8723751974:AAFBnzKUi0n-wgJBaCqpGi2VT5cme8teVZ4"
+CHAT_ID = "7138785294"
+FIREBASE_URL = "https://tuan-anh-dz-default-rtdb.asia-southeast1.firebasedatabase.app/.json"
+
+CHECK_INTERVAL = 1       # Kiểm tra Firebase mỗi 1 giây để báo bill ngay lập tức
+RECONNECT_INTERVAL = 5   # Nếu mất kết nối, tự động thử lại sau 5 giây
+
+SENT_FILE = "sent_transactions.json"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# ==================== TẢI & LƯU LỊCH SỬ GỬI BILL ====================
+def load_sent():
+    if not os.path.exists(SENT_FILE):
+        return []
+    try:
+        with open(SENT_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_sent(data):
+    try:
+        with open(SENT_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logging.error(f"Lỗi ghi file lịch sử: {e}")
+
+# ==================== HÀM TRÁNH LỖI CÚ PHÁP MARKDOWNV2 ====================
+def escape_markdown_v2(text):
+    """Tự động chèn dấu gạch chéo ngược trước các ký tự đặc biệt để tránh lỗi Telegram"""
+    escape_chars = r"_*[]()~`>#+-=|{}.!\\"
+    return "".join(f"\\{char}" if char in escape_chars else char for char in str(text))
+
+# ==================== ĐỊNH DẠNG VÀ GỬI BILL ====================
+async def send_bill(bot, tx):
+    amount = int(tx.get("amount", 0))
+    try:
+        time_str = datetime.datetime.fromtimestamp(
+            tx.get("timestamp", 0) / 1000
+        ).strftime("%H:%M:%S %d/%m/%Y")
+    except Exception:
+        time_str = "Không xác định"
+        
+    amount_text = f"{amount:,}".replace(",", ".")
+    
+    # Xử lý chuỗi an toàn chống lỗi hiển thị Telegram MarkdownV2
+    username = escape_markdown_v2(tx.get('username', 'N/A'))
+    tx_id = escape_markdown_v2(tx.get('transactionId', 'N/A'))
+    amount_text = escape_markdown_v2(amount_text)
+    time_str = escape_markdown_v2(time_str)
+    
+    # Giao diện tiếng Việt thiết kế mới dạng Hóa Đơn Premium cực đẹp
+    message = (
+        f"👑 *HÓA ĐƠN THANH TOÁN THÀNH CÔNG*\n"
+        
+        f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
+        f"👤 *Khách hàng:* `{username}`\n"
+        f"📦 *Sản phẩm:* _1 Key Tools HSD Gói 1 Ngày_\n"
+        f"💰 *Tổng tiền:* 🔥 `{amount_text}đ`\n"
+        f"📝 *Mã giao dịch:* `{tx_id}`\n"
+        f"⚙️ *Trạng thái:* ✅  *ĐÃ PHÊ DUYỆT*\n"
+        f"🕒 *Thời gian:* `{time_str}`\n"
+        f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
+        f"✨ _Cảm ơn bạn đã lựa chọn dịch vụ của chúng tôi_"
+    )
+    
+    try:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=message,
+            parse_mode="MarkdownV2"
+        )
+    except Exception as e:
+        logging.error(f"Lỗi gửi tin nhắn Telegram: {e}")
+
+# ==================== THEO DÕI FIREBASE LIÊN TỤC ====================
+async def monitor(bot):
+    sent_ids = load_sent()
+    logging.info("🚀 Hệ thống bắt đầu quét giao dịch thời gian thực...")
+    
+    while True:
+        try:    
+            response = requests.get(FIREBASE_URL, timeout=10)    
+            data = response.json()    
+
+            if not isinstance(data, dict):    
+                await asyncio.sleep(CHECK_INTERVAL)    
+                continue    
+
+            deposit_requests = data.get("deposit_requests", {})    
+
+            for key, tx in deposit_requests.items():    
+                if not isinstance(tx, dict):
+                    continue
+
+                transaction_id = tx.get("transactionId", "")    
+                status = str(tx.get("status", "")).lower()    
+
+                if not transaction_id:    
+                    continue    
+
+                if status != "approved":    
+                    continue    
+
+                if transaction_id in sent_ids:    
+                    continue    
+
+                # Tiến hành gửi thông báo tức thì
+                await send_bill(bot, tx)    
+
+                # Lưu vào bộ nhớ đệm và file cục bộ chống trùng bill
+                sent_ids.append(transaction_id)    
+                save_sent(sent_ids)    
+
+                logging.info(f"✅ Đã gửi bill thành công cho GD: {transaction_id}")    
+
+            # Nghỉ 1 giây trước khi quét chu kỳ tiếp theo
+            await asyncio.sleep(CHECK_INTERVAL)
+
+        except (requests.exceptions.RequestException, Exception) as e:    
+            # Khi mất mạng, mất kết nối Firebase, loop sẽ rơi vào đây
+            logging.error(f"❌ Mất kết nối tới Firebase: {e}")
+            logging.info(f"🔄 Đang tự động thiết lập lại kết nối sau {RECONNECT_INTERVAL} giây...")
+            
+            # Đợi đúng 5 giây trước khi thực hiện vòng lặp thử lại kết nối mới
+            await asyncio.sleep(RECONNECT_INTERVAL)  
+
+# ==================== KHỞI ĐỘNG HỆ THỐNG ====================
+async def post_init(app):
+    asyncio.create_task(
+        monitor(app.bot)
+    )
+
+if __name__ == "__main__":
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+    print("=========================================")
+    print("🔔 BOT TELEGRAM ĐANG THEO DÕI GIAO DỊCH...")
+    print("=========================================")
+    app.run_polling()
